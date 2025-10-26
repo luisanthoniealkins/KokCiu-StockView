@@ -31,8 +31,7 @@ calamine = "0.22"
 tauri-plugin-dialog = "2"
 tauri-plugin-log = { version = "2", features = ["colored"] }
 thiserror = "1.0"
-
-
+itertools = "0.13"
 
 
 [alias]

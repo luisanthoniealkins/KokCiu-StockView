@@ -15,6 +15,7 @@ use thiserror::Error;
 use std::io;
 use std::path::Path;
 use std::fs;
+use itertools::Itertools;
 
 // create the error type that represents all errors possible in our program
 #[derive(Debug, thiserror::Error)]
@@ -41,14 +42,6 @@ impl serde::Serialize for CommandError {
   }
 }
 
-#[derive(Deserialize)]
-struct ProductQuery {
-    search: Option<String>,
-    category: Option<String>,
-    sort_by: Option<String>,
-    sort_dir: Option<String>,
-}
-
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow, Clone)]
 struct Product {
     id: i64,
@@ -64,9 +57,31 @@ struct Product {
 
 struct AppState {
     data: Mutex<Vec<Product>>,
+    tableState: Mutex<SortState>,
+    filter: Mutex<Filter>,
 }
-pub const DB_DIR: &str = "/data";
-pub const DB_PATH: &str = "/data/database.sqlite";
+
+#[derive(Deserialize, Clone)]
+struct SortState {
+    column: String,
+    direction: String,
+}
+
+#[derive(Deserialize, Clone)]
+struct Filter {
+    id: String,
+    code: String,
+    name: String,
+    brand: String,
+    car_type: String,
+    price: String,
+    price_code: String,
+    date: String,
+    quantity: String,
+}
+
+const DB_DIR: &str = "./data";
+const DB_PATH: &str = "./data/database.sqlite";
 
 #[tauri::command]
 fn load_excel_file(path: String, state: State<AppState>) -> Result<Vec<Product>, CommandError> {
@@ -91,7 +106,9 @@ fn load_excel_file(path: String, state: State<AppState>) -> Result<Vec<Product>,
         
         let price_code = &record[5];
         let date = &record[6];
-        let quantity: i64 = record[7].parse()?;
+
+        let quantity_text = &record[7].replace(",", "");
+        let quantity: i64 = quantity_text.parse()?;
         
         products.push(
             Product { 
@@ -108,17 +125,18 @@ fn load_excel_file(path: String, state: State<AppState>) -> Result<Vec<Product>,
         );
 
         // TODO: Remove
-        debug!("{} {} {} {} {} {} {} {}", code, name, brand, car_type, price, price_code, date, quantity);
         a += 1;
-        if a == 20 {
+        if a == 50 {
             break;
         }
     }
 
-    let mut locked = state.data.lock().unwrap();
-    *locked = products.clone();
+    {
+        let mut locked = state.data.lock().unwrap();
+        *locked = products.clone();
+    }
 
-    Ok(products)
+    Ok(get_filtered_products(&state))
 }
 
 #[tauri::command]
@@ -157,16 +175,22 @@ async fn load_db_file(state: State<'_, AppState>) -> Result<Vec<Product>, Comman
     }
 
     // Save to app state
-    let mut locked = state.data.lock().unwrap();
-    *locked = products.clone();
+    {
+        let mut locked = state.data.lock().unwrap();
+        *locked = products.clone();
+    }
 
-    Ok(products)
+    Ok(get_filtered_products(&state))
 }
 
 #[tauri::command]
 async fn export_db_file(state: tauri::State<'_, AppState>) -> Result<String, CommandError> {
     fs::create_dir_all(DB_DIR)?;
-    fs::remove_file(DB_PATH)?;
+
+    let file_path = Path::new(DB_PATH);
+    if file_path.exists() {
+        fs::remove_file(file_path)?;
+    }
 
     if !Sqlite::database_exists(DB_PATH).await? {
         println!("Creating database {}", DB_PATH);
@@ -231,28 +255,73 @@ async fn export_db_file(state: tauri::State<'_, AppState>) -> Result<String, Com
     Ok("Database exported successfully!".to_string())
 }
 
-fn set_filter() { // param: Filter Query
-    // add filtering condition
-    // search per category
-    // order by category | asc or desc
+#[tauri::command]
+async fn set_table_state(sort_state: SortState, filters: Filter, state: State<'_, AppState>) -> Result<Vec<Product>, CommandError> { 
+    {
+        let mut locked = state.tableState.lock().unwrap();
+        *locked = sort_state.clone();
 
-    // return value (by filter)
+        let mut locked = state.filter.lock().unwrap();
+        *locked = filters.clone();
+    }
+
+    Ok(get_filtered_products(&state))
 }
 
+fn get_filtered_products(state: &State<'_, AppState>) -> Vec<Product> {
+    let products = {
+        let guard = state.data.lock().unwrap();
+        guard.clone()
+    };
+
+    let sort_state = {
+        let guard = state.tableState.lock().unwrap();
+        guard.clone()
+    };
+
+    let filters = {
+        let guard = state.filter.lock().unwrap();
+        guard.clone()
+    };
+
+    let mut sorted_products = products.iter()
+    .filter(|p|
+        (filters.id == "" || filters.id != "" && p.id.to_string().contains(&filters.id.to_uppercase())) && 
+        (filters.code == "" || filters.code != "" && p.code.contains(&filters.code.to_uppercase())) && 
+        (filters.name == "" || filters.name != "" && p.name.contains(&filters.name.to_uppercase())) && 
+        (filters.brand == "" || filters.brand != "" && p.brand.contains(&filters.brand.to_uppercase())) && 
+        (filters.car_type == "" || filters.car_type != "" && p.car_type.contains(&filters.car_type.to_uppercase())) && 
+        (filters.price == "" || filters.price != "" && p.price.to_string().contains(&filters.price.to_uppercase())) && 
+        (filters.price_code == "" || filters.price_code != "" && p.price_code.contains(&filters.price_code.to_uppercase())) && 
+        (filters.date == "" || filters.date != "" && p.date.contains(&filters.date.to_uppercase())) && 
+        (filters.quantity == "" || filters.quantity != "" && p.quantity.to_string().contains(&filters.quantity.to_uppercase())) 
+    )
+    .sorted_by(|a, b| 
+        match sort_state.column.as_str() {
+            "id" => a.id.cmp(&b.id),
+            "code" => a.code.cmp(&b.code),
+            "name" => a.name.cmp(&b.name),
+            "brand" => a.brand.cmp(&b.brand),
+            "car_type" => a.car_type.cmp(&b.car_type),
+            "price" => a.price.cmp(&b.price),
+            "price_code" => a.price_code.cmp(&b.price_code),
+            "date" => a.date.cmp(&b.date),
+            "quantity" => a.quantity.cmp(&b.quantity),
+            _ => a.id.cmp(&b.id),
+        }
+    )
+    .cloned()
+    .collect::<Vec<_>>();
+
+    if sort_state.direction.as_str() != "asc" {
+        sorted_products.reverse();
+    }
+
+    return sorted_products
+}
 
 #[tokio::main]
 async fn main() {
-    // let db_path = PathBuf::from("../data/database.sqlite");
-
-    // if let Some(parent) = db_path.parent() {
-    //     std::fs::create_dir_all(parent).unwrap();
-    // }
-
-    // let db_url = format!("sqlite://{}", db_path.display());
-    // let pool = SqlitePool::connect(&db_url)
-    //     .await
-    //     .expect("Failed to connect to database");
-
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(dialog_init())
@@ -261,14 +330,33 @@ async fn main() {
                 .target(Target::new(TargetKind::Stdout)) // Logs to the terminal
                 .build(),
         )
-        // .manage(pool)
         .manage(AppState{
             data: Mutex::new(vec![]),
+            tableState: Mutex::new(
+                SortState {
+                    column: "id".to_string(),
+                    direction: "asc".to_string(),
+                }
+            ),
+            filter: Mutex::new(
+                Filter { 
+                    id: "".to_string(), 
+                    code: "".to_string(), 
+                    name: "".to_string(), 
+                    brand: "".to_string(), 
+                    car_type: "".to_string(), 
+                    price: "".to_string(), 
+                    price_code: "".to_string(), 
+                    date: "".to_string(), 
+                    quantity: "".to_string() 
+                }
+            )
         })
         .invoke_handler(tauri::generate_handler![
             load_excel_file,
             load_db_file,
             export_db_file,
+            set_table_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
