@@ -1,21 +1,23 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
-use sqlx::{query, Row, SqlitePool, Executor, sqlite::SqlitePoolOptions, migrate::MigrateDatabase, Sqlite};
+use sqlx::{SqlitePool, Executor, sqlite::SqlitePoolOptions, migrate::MigrateDatabase, Sqlite};
 use std::num::ParseIntError;
-use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::{State, AppHandle};
+use tauri::{State};
 use tauri_plugin_dialog::init as dialog_init;
 use tauri_plugin_log::log::{debug, error, info, trace, warn};
 use tauri_plugin_log::{Target, TargetKind};
 use std::fs::File;
-use thiserror::Error;
-use std::io;
 use std::path::Path;
 use std::fs;
 use itertools::Itertools;
+use std::time::Instant;
+use font_kit::source::SystemSource;
+use font_kit::properties::Properties;
+use font_kit::family_name::FamilyName;
 
 // create the error type that represents all errors possible in our program
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +61,7 @@ struct AppState {
     data: Mutex<Vec<Product>>,
     tableState: Mutex<SortState>,
     filter: Mutex<Filter>,
+    longest_col: Mutex<Product>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -69,7 +72,6 @@ struct SortState {
 
 #[derive(Deserialize, Clone)]
 struct Filter {
-    id: String,
     code: String,
     name: String,
     brand: String,
@@ -86,9 +88,10 @@ const DB_PATH: &str = "./data/database.sqlite";
 #[tauri::command]
 fn load_excel_file(path: String, state: State<AppState>) -> Result<Vec<Product>, CommandError> {
     // TODO: Remove
-    debug!("{:?}", path);
     let file = File::open(path)?;
-    let mut rdr = csv::Reader::from_reader(file);
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(file);
     let mut products: Vec<Product> = Vec::new();
 
     let mut a = 0;
@@ -124,16 +127,17 @@ fn load_excel_file(path: String, state: State<AppState>) -> Result<Vec<Product>,
             }
         );
 
-        // TODO: Remove
         a += 1;
-        if a == 50 {
-            break;
-        }
     }
 
     {
         let mut locked = state.data.lock().unwrap();
-        *locked = products.clone();
+        *locked = products;
+    }
+
+    {
+        let mut locked = state.longest_col.lock().unwrap();
+        *locked = get_longest_text_in_each_category(&state);
     }
 
     Ok(get_filtered_products(&state))
@@ -177,8 +181,15 @@ async fn load_db_file(state: State<'_, AppState>) -> Result<Vec<Product>, Comman
     // Save to app state
     {
         let mut locked = state.data.lock().unwrap();
-        *locked = products.clone();
+        *locked = products;
     }
+
+    {
+        let mut locked = state.longest_col.lock().unwrap();
+        *locked = get_longest_text_in_each_category(&state);
+    }
+
+    get_longest_text_in_each_category(&state);
 
     Ok(get_filtered_products(&state))
 }
@@ -231,6 +242,7 @@ async fn export_db_file(state: tauri::State<'_, AppState>) -> Result<String, Com
     .await?;
 
     // Insert all records
+    let mut tx = pool.begin().await?;
     for product in data {
         sqlx::query(
             r#"
@@ -240,17 +252,18 @@ async fn export_db_file(state: tauri::State<'_, AppState>) -> Result<String, Com
             "#,
         )
         .bind(product.id)
-        .bind(product.code)
-        .bind(product.name)
-        .bind(product.brand)
-        .bind(product.car_type)
+        .bind(&product.code)
+        .bind(&product.name)
+        .bind(&product.brand)
+        .bind(&product.car_type)
         .bind(product.price)
-        .bind(product.price_code)
-        .bind(product.date)
+        .bind(&product.price_code)
+        .bind(&product.date)
         .bind(product.quantity)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
 
     Ok("Database exported successfully!".to_string())
 }
@@ -268,7 +281,72 @@ async fn set_table_state(sort_state: SortState, filters: Filter, state: State<'_
     Ok(get_filtered_products(&state))
 }
 
+
+#[tauri::command]
+fn get_product_cols(state: State<'_, AppState>) -> Result<Product, CommandError> {
+    let cols = {
+        let guard = state.longest_col.lock().unwrap();
+        guard.clone()
+    };
+
+    Ok(cols)
+}
+
+#[tauri::command]
+fn get_product_count(state: State<'_, AppState>) -> Result<usize, CommandError> {
+    let product = {
+        let guard = state.data.lock().unwrap();
+        guard.clone()
+    };
+
+    Ok(product.len())
+}
+
+fn measure_text(font: &font_kit::font::Font, text: &str, size: f32) -> f32 {
+    
+    let mut total_width = 0.0;
+    for ch in text.chars() {
+        if let Some(glyph_id) = font.glyph_for_char(ch) {
+            let metrics = font.metrics();
+            // Get glyph advance vector at the given size
+            let advance = font.advance(glyph_id).unwrap_or_default();
+            total_width += advance.x() * size / metrics.units_per_em as f32;
+        }
+    }
+    total_width
+}
+
+fn get_longest_text_in_each_category(state: &State<'_, AppState>) -> Product {
+    let products = {
+        let guard = state.data.lock().unwrap();
+        guard.clone()
+    };
+
+    let font = SystemSource::new()
+        .select_best_match(&[FamilyName::Title("Arial".into())], &Properties::new())
+        .unwrap()
+        .load()
+        .unwrap();
+
+    let font_size = 16.0;
+    let a  = Product {
+        id: products.iter().map(|p|p.id).max_by_key(|f| (measure_text(&font, &f.to_string(), font_size)*1000.0) as i64).unwrap_or(0),
+        code: products.iter().map(|p|p.clone().code).max_by_key(|f| (measure_text(&font, &f, font_size)*1000.0) as i64).unwrap_or("".into()),
+        name: products.iter().map(|p|p.clone().name).max_by_key(|f| (measure_text(&font, &f, font_size)*1000.0) as i64).unwrap_or("".into()),
+        brand: products.iter().map(|p|p.clone().brand).max_by_key(|f| (measure_text(&font, &f, font_size)*1000.0) as i64).unwrap_or("".into()),
+        car_type: products.iter().map(|p|p.clone().car_type).max_by_key(|f| (measure_text(&font, &f, font_size)*1000.0) as i64).unwrap_or("".into()),
+        price: products.iter().map(|p|p.price).max_by_key(|f| (measure_text(&font, &f.to_string(), font_size)*1000.0) as i64).unwrap_or(0),
+        price_code: products.iter().map(|p|p.clone().price_code).max_by_key(|f| (measure_text(&font, &f, font_size)*1000.0) as i64).unwrap_or("".into()),
+        date: products.iter().map(|p|p.clone().date).max_by_key(|f| (measure_text(&font, &f, font_size)*1000.0) as i64).unwrap_or("".into()),
+        quantity: products.iter().map(|p|p.quantity).max_by_key(|f| (measure_text(&font, &f.to_string(), font_size)*1000.0) as i64).unwrap_or(0),
+    };
+
+    return a;
+} 
+
 fn get_filtered_products(state: &State<'_, AppState>) -> Vec<Product> {
+    let start = Instant::now();
+
     let products = {
         let guard = state.data.lock().unwrap();
         guard.clone()
@@ -284,9 +362,11 @@ fn get_filtered_products(state: &State<'_, AppState>) -> Vec<Product> {
         guard.clone()
     };
 
+    println!("Execution time 1: {:?}", start.elapsed());
+    let start = Instant::now();
+
     let mut sorted_products = products.iter()
     .filter(|p|
-        (filters.id == "" || filters.id != "" && p.id.to_string().contains(&filters.id.to_uppercase())) && 
         (filters.code == "" || filters.code != "" && p.code.contains(&filters.code.to_uppercase())) && 
         (filters.name == "" || filters.name != "" && p.name.contains(&filters.name.to_uppercase())) && 
         (filters.brand == "" || filters.brand != "" && p.brand.contains(&filters.brand.to_uppercase())) && 
@@ -298,7 +378,6 @@ fn get_filtered_products(state: &State<'_, AppState>) -> Vec<Product> {
     )
     .sorted_by(|a, b| 
         match sort_state.column.as_str() {
-            "id" => a.id.cmp(&b.id),
             "code" => a.code.cmp(&b.code),
             "name" => a.name.cmp(&b.name),
             "brand" => a.brand.cmp(&b.brand),
@@ -313,8 +392,17 @@ fn get_filtered_products(state: &State<'_, AppState>) -> Vec<Product> {
     .cloned()
     .collect::<Vec<_>>();
 
+    println!("Execution time 2: {:?}", start.elapsed());
+    let start = Instant::now();
+
     if sort_state.direction.as_str() != "asc" {
         sorted_products.reverse();
+    }
+
+    println!("Execution time 3: {:?}", start.elapsed());
+
+    for (index, item) in sorted_products.iter_mut().enumerate() {
+        item.id = index as i64;
     }
 
     return sorted_products
@@ -340,7 +428,6 @@ async fn main() {
             ),
             filter: Mutex::new(
                 Filter { 
-                    id: "".to_string(), 
                     code: "".to_string(), 
                     name: "".to_string(), 
                     brand: "".to_string(), 
@@ -350,6 +437,19 @@ async fn main() {
                     date: "".to_string(), 
                     quantity: "".to_string() 
                 }
+            ),
+            longest_col: Mutex::new(
+                Product {
+                    id: 0,
+                    code: "".into(),
+                    name: "".into(),
+                    brand: "".into(),
+                    car_type: "".into(),
+                    price: 0,
+                    price_code: "".into(),
+                    date: "".into(),
+                    quantity: 0,
+                }
             )
         })
         .invoke_handler(tauri::generate_handler![
@@ -357,9 +457,12 @@ async fn main() {
             load_db_file,
             export_db_file,
             set_table_state,
+            get_product_cols,
+            get_product_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+    
 
-    debug!("Hello");
+    
 }
