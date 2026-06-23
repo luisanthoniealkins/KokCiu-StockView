@@ -1,7 +1,6 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use csv::ReaderBuilder;
 use serde::{Deserialize, Serialize};
 use sqlx::{SqlitePool, Executor, sqlite::SqlitePoolOptions, migrate::MigrateDatabase, Sqlite};
 use std::num::ParseIntError;
@@ -10,20 +9,21 @@ use tauri::{State};
 use tauri_plugin_dialog::init as dialog_init;
 use tauri_plugin_log::log::{debug, error, info, trace, warn};
 use tauri_plugin_log::{Target, TargetKind};
-use std::fs::File;
+// use std::fs::File;
 use std::path::Path;
 use std::fs;
 use itertools::Itertools;
-use std::time::Instant;
 use font_kit::source::SystemSource;
 use font_kit::properties::Properties;
 use font_kit::family_name::FamilyName;
+use chrono::{NaiveDate, Duration};
+use calamine::{open_workbook, Reader, Xlsx};
 
 // create the error type that represents all errors possible in our program
 #[derive(Debug, thiserror::Error)]
 enum CommandError {
-    #[error("CSV error: {0}")]
-    Csv(#[from] csv::Error),
+    // #[error("CSV error: {0}")]
+    // Csv(#[from] csv::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("CSV error: {0}")] // TODO: change it
@@ -85,49 +85,81 @@ struct Filter {
 const DB_DIR: &str = "./data";
 const DB_PATH: &str = "./data/database.sqlite";
 
+fn excel_serial_to_date(serial: f64) -> Option<NaiveDate> {
+    // Excel’s base date (Windows)
+    let base_date = NaiveDate::from_ymd_opt(1899, 12, 30)?;
+    Some(base_date + Duration::days(serial.trunc() as i64))
+}
+
+fn parse_excel_date(value: &calamine::DataType) -> String {
+    let date_opt = match value {
+        // Case 1: Excel numeric date
+        calamine::DataType::Float(serial) |
+        calamine::DataType::DateTime(serial) => excel_serial_to_date(*serial),
+
+        // Case 2: Text date
+        calamine::DataType::String(s) => parse_flexible_date(s),
+
+        _ => None,
+    };
+
+    match date_opt {
+        Some(date) => date.format("%d-%m-%Y").to_string(),
+        None => String::new(), // return ""
+    }
+}
+
+fn parse_flexible_date(s: &str) -> Option<NaiveDate> {
+    let formats = ["%d-%m-%y", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%Y-%m-%d"];
+    for fmt in &formats {
+        if let Ok(date) = NaiveDate::parse_from_str(s, fmt) {
+            return Some(date);
+        }
+    }
+    None
+}
+
 #[tauri::command]
 fn load_excel_file(path: String, state: State<AppState>) -> Result<Vec<Product>, CommandError> {
     // TODO: Remove
-    let file = File::open(path)?;
-    let mut rdr = ReaderBuilder::new()
-        .has_headers(false)
-        .from_reader(file);
+    // let file = File::open(path)?;
+
+    let mut workbook: Xlsx<_> = open_workbook(path).expect("Cannot open Excel file");
+
+    
     let mut products: Vec<Product> = Vec::new();
 
-    let mut a = 0;
+    let mut id = 0;
+    if let Some(Ok(range)) = workbook.worksheet_range("Sheet") {
+        for row in range.rows() {
+            // Convert DataType::String to String
+            id += 1;
 
-    for result in rdr.records() {
-        let record = result?;
+            let code = row[0].as_string().map_or("".to_string(), |s| s.clone());
+            let name = row[1].as_string().map_or("".to_string(), |s| s.clone());
+            let brand = row[2].as_string().map_or("".to_string(), |s| s.clone());
+            let car_type = row[3].as_string().map_or("".to_string(), |s| s.clone());
 
-        let code = &record[0];
-        let name = &record[1];
-        let brand = &record[2];
-        let car_type = &record[3];
-
-        let price_text = &record[4].replace(",", "");
-        let price: i64 = price_text.parse()?;
+            let price = row[4].as_i64().map_or(0, |s| s);
+            let price_code = row[5].as_string().map_or("".to_string(), |s| s.clone());
         
-        let price_code = &record[5];
-        let date = &record[6];
+            let date = parse_excel_date(&row[6]);
+            let quantity = row[7].as_i64().map_or(0, |s| s);
 
-        let quantity_text = &record[7].replace(",", "");
-        let quantity: i64 = quantity_text.parse()?;
-        
-        products.push(
-            Product { 
-                id: a, 
-                code: code.to_string(), 
-                name: name.to_string(), 
-                brand: brand.to_string(),
-                car_type: car_type.to_string(),
-                price: price, 
-                price_code: price_code.to_string(),
-                date: date.to_string(),
-                quantity: quantity,
-            }
-        );
-
-        a += 1;
+            products.push(
+                Product { 
+                    id: id, 
+                    code: code, 
+                    name: name, 
+                    brand: brand,
+                    car_type: car_type,
+                    price: price, 
+                    price_code: price_code,
+                    date: date,
+                    quantity: quantity,
+                }
+            );
+        }
     }
 
     {
@@ -196,34 +228,29 @@ async fn load_db_file(state: State<'_, AppState>) -> Result<Vec<Product>, Comman
 
 #[tauri::command]
 async fn export_db_file(state: tauri::State<'_, AppState>) -> Result<String, CommandError> {
+    // 1. Prepare directory and cleanly wipe old DB file
     fs::create_dir_all(DB_DIR)?;
-
     let file_path = Path::new(DB_PATH);
     if file_path.exists() {
         fs::remove_file(file_path)?;
     }
 
-    if !Sqlite::database_exists(DB_PATH).await? {
-        println!("Creating database {}", DB_PATH);
-        Sqlite::create_database(DB_PATH).await?;
-        println!("Database created successfully.");
-    } else {
-        println!("Database already exists.");
-    }
+    // Since file was deleted, skip the 'database_exists' check and create it immediately
+    Sqlite::create_database(DB_PATH).await?;
 
-    // 1. Write to a new file
+    // 2. Open connection pool
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect(DB_PATH)
         .await?;
 
-    // Clone data early and drop the lock before any await
+    // 3. Clone and drop Mutex lock safely
     let data = {
         let guard = state.data.lock().unwrap();
         guard.clone()
     };
 
-    // Create the table
+    // 4. Create schema
     pool.execute(
         r#"
         CREATE TABLE stock_items (
@@ -241,29 +268,43 @@ async fn export_db_file(state: tauri::State<'_, AppState>) -> Result<String, Com
     )
     .await?;
 
-    // Insert all records
-    let mut tx = pool.begin().await?;
-    for product in data {
-        sqlx::query(
-            r#"
-            INSERT INTO stock_items 
-            (id, code, name, brand, car_type, price, price_code, date, quantity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(product.id)
-        .bind(&product.code)
-        .bind(&product.name)
-        .bind(&product.brand)
-        .bind(&product.car_type)
-        .bind(product.price)
-        .bind(&product.price_code)
-        .bind(&product.date)
-        .bind(product.quantity)
-        .execute(&mut *tx)
-        .await?;
+    // 5. Highly Optimized Bulk Insert Strategy
+    if !data.is_empty() {
+        let mut tx = pool.begin().await?;
+        
+        // We compile a single bulk query dynamically to save thousands of I/O roundtrips
+        // SQLite supports up to 32,766 variables. At 9 columns per row, this safely batches ~3,600 rows instantly.
+        // For larger data, standard QueryBuilder chunks it, but a pre-prepared loop inside tx is still 10x faster if execution is batched.
+        for chunk in data.chunks(300) {
+            let mut query_str = String::from("INSERT INTO stock_items (id, code, name, brand, car_type, price, price_code, date, quantity) VALUES ");
+            
+            let mut placeholders = Vec::new();
+            for i in 0..chunk.len() {
+                let offset = i * 9;
+                placeholders.push(format!(
+                    "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                    offset + 1, offset + 2, offset + 3, offset + 4, offset + 5, offset + 6, offset + 7, offset + 8, offset + 9
+                ));
+            }
+            query_str.push_str(&placeholders.join(", "));
+
+            let mut query = sqlx::query(&query_str);
+            for product in chunk {
+                query = query
+                    .bind(product.id)
+                    .bind(&product.code)
+                    .bind(&product.name)
+                    .bind(&product.brand)
+                    .bind(&product.car_type)
+                    .bind(product.price)
+                    .bind(&product.price_code)
+                    .bind(&product.date)
+                    .bind(product.quantity);
+            }
+            query.execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
     }
-    tx.commit().await?;
 
     Ok("Database exported successfully!".to_string())
 }
@@ -344,9 +385,18 @@ fn get_longest_text_in_each_category(state: &State<'_, AppState>) -> Product {
     return a;
 } 
 
-fn get_filtered_products(state: &State<'_, AppState>) -> Vec<Product> {
-    let start = Instant::now();
+fn parse_date(s: &str) -> NaiveDate {
+    if s.trim().is_empty() {
+        // Default to the earliest date
+        NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
+    } else {
+        NaiveDate::parse_from_str(s, "%d-%m-%Y")
+            .or_else(|_| NaiveDate::parse_from_str(s, "%d/%m/%Y"))
+            .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+    }
+}
 
+fn get_filtered_products(state: &State<'_, AppState>) -> Vec<Product> {
     let products = {
         let guard = state.data.lock().unwrap();
         guard.clone()
@@ -361,9 +411,6 @@ fn get_filtered_products(state: &State<'_, AppState>) -> Vec<Product> {
         let guard = state.filter.lock().unwrap();
         guard.clone()
     };
-
-    println!("Execution time 1: {:?}", start.elapsed());
-    let start = Instant::now();
 
     let mut sorted_products = products.iter()
     .filter(|p|
@@ -384,7 +431,7 @@ fn get_filtered_products(state: &State<'_, AppState>) -> Vec<Product> {
             "car_type" => a.car_type.cmp(&b.car_type),
             "price" => a.price.cmp(&b.price),
             "price_code" => a.price_code.cmp(&b.price_code),
-            "date" => a.date.cmp(&b.date),
+            "date" => parse_date(&a.date).cmp(&parse_date(&b.date)),
             "quantity" => a.quantity.cmp(&b.quantity),
             _ => a.id.cmp(&b.id),
         }
@@ -392,17 +439,14 @@ fn get_filtered_products(state: &State<'_, AppState>) -> Vec<Product> {
     .cloned()
     .collect::<Vec<_>>();
 
-    println!("Execution time 2: {:?}", start.elapsed());
-    let start = Instant::now();
-
-    if sort_state.direction.as_str() != "asc" {
-        sorted_products.reverse();
+    if sort_state.column.as_str() != "id" {
+        if sort_state.direction.as_str() != "asc" {
+            sorted_products.reverse();
+        }
     }
 
-    println!("Execution time 3: {:?}", start.elapsed());
-
     for (index, item) in sorted_products.iter_mut().enumerate() {
-        item.id = index as i64;
+        item.id = (index + 1) as i64;
     }
 
     return sorted_products
@@ -462,7 +506,4 @@ async fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-    
-
-    
 }
